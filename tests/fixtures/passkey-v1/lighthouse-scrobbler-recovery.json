@@ -1,0 +1,16 @@
+{
+  "format": "lighthouse-scrobbler-recovery",
+  "version": 1,
+  "recipient": "age16y8x9r8z8hcr5tma3h0qe3zpg7dtsu94vv8ud3762wpdtvz4wvasgl4yds",
+  "envelopes": [
+    {
+      "kind": "webauthn-prf-v1",
+      "rp_id": "localhost",
+      "credential_id": "fixture-credential",
+      "prf_salt": "1qelvO5FO3eXrNVZ7TUeN0Z_f2MfrqGTtiopPWKMjm4",
+      "nonce": "X5lYJpBO6SkdebPJQ8O6Bhsay511s7Fm",
+      "ciphertext": "ute1Sr7KyiZLkyHzuBfUzbAqyrva0RNvQQWrKQeMzjw",
+      "created_at": "2026-11-07T09:40:13.219175133Z"
+    }
+  ]
+}

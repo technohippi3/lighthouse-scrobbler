@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Listening history backup</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 34rem; margin: 4rem auto; padding: 0 1.25rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  button { font: inherit; padding: .6rem 1.2rem; border-radius: .5rem; border: 1px solid #888; cursor: pointer; }
+  button[hidden], p[hidden] { display: none; }
+  #choose button { margin: 0 .5rem .5rem 0; }
+  #status { margin-top: 1.25rem; min-height: 3rem; }
+  .error { color: #c62828; }
+  .ok { color: #2e7d32; }
+  .small { font-size: .85rem; opacity: .75; }
+</style>
+</head>
+<body>
+<h1 id="title">Listening history backup</h1>
+<p id="intro"></p>
+<p id="choose" hidden>
+  <button id="go-key" type="button">Use a security key</button>
+  <button id="go-device" type="button">Use this device or a phone</button>
+</p>
+<button id="again" type="button" hidden>Approve once more to finish</button>
+<p id="status" role="status"></p>
+<p class="small">This page works only for the lighthouse-scrobbler app on this computer. What it
+sends back is encrypted so that only that app can read it.</p>
+<script>
+"use strict";
+// Session parameters arrive in the URL fragment, which browsers never send to
+// the server hosting this page. The result is encrypted to the app's
+// per-session key. Served by the app itself on localhost, the page posts it
+// straight back; served from the web, it drops it in a one-shot mailbox on
+// this same site, where the app collects it. Either way only ciphertext moves.
+const HANDOFF = "lhs-handoff-v1";
+const $ = (id) => document.getElementById(id);
+const te = new TextEncoder();
+const enc = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const dec = (s) => {
+  const b = s.replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(b + "=".repeat((4 - b.length % 4) % 4)), (c) => c.charCodeAt(0));
+};
+const say = (text, cls) => { $("status").textContent = text; $("status").className = cls || ""; };
+const LOOPBACK = /^http:\/\/localhost:\d{1,5}\/[A-Za-z0-9_-]{16,}\/result$/;
+const MAILBOX = /^[A-Za-z0-9_-]{22,64}$/;
+const LOCAL = location.hostname === "localhost";
+
+let cfg = null;
+try {
+  cfg = JSON.parse(new TextDecoder().decode(dec(location.hash.slice(1))));
+  history.replaceState(null, "", location.pathname);  // keep it out of history
+} catch (_) { cfg = null; }
+
+async function seal(obj) {
+  const appKey = await crypto.subtle.importKey("raw", dec(cfg.appKey), { name: "X25519" }, false, []);
+  const eph = await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
+  const shared = await crypto.subtle.deriveBits({ name: "X25519", public: appKey }, eph.privateKey, 256);
+  const hk = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: te.encode(cfg.token), info: te.encode(HANDOFF) },
+    hk, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aad = te.encode(HANDOFF + "\0" + cfg.token + "\0" + location.origin);
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: aad }, key, te.encode(JSON.stringify(obj)));
+  const epk = await crypto.subtle.exportKey("raw", eph.publicKey);
+  return JSON.stringify({ epk: enc(epk), iv: enc(iv), ct: enc(ct) });
+}
+
+async function post(obj) {
+  const r = LOCAL
+    ? await fetch(cfg.resultUrl, { method: "POST", headers: { "Content-Type": "text/plain" }, body: await seal(obj) })
+    : await fetch("/mailbox/" + cfg.mailbox, { method: "PUT", headers: { "Content-Type": "text/plain" }, body: await seal(obj) });
+  if (!r.ok) throw new Error("the app did not accept the result (" + r.status + ")");
+}
+
+// A USB or NFC key such as a YubiKey. Without this hint some browsers jump
+// straight to a built-in authenticator that can't create this passkey.
+let securityKey = false;
+const hints = () => securityKey ? { hints: ["security-key"] } : {};
+
+async function fail(message) {
+  say(message, "error");
+  $("choose").hidden = true; $("again").hidden = true;
+  try { await post({ error: message }); } catch (_) { /* app already gone */ }
+}
+
+function waitForClick(button) {
+  button.hidden = false;
+  return new Promise((resolve) => button.addEventListener("click", () => {
+    button.hidden = true; resolve();
+  }, { once: true }));
+}
+
+async function enroll() {
+  const cred = await navigator.credentials.create({ publicKey: {
+    rp: { id: location.hostname, name: "Listening history backup" },
+    user: { id: dec(cfg.userId), name: "listening-history", displayName: "Listening history backup" },
+    challenge: dec(cfg.challenge),
+    pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+    authenticatorSelection: {
+      residentKey: "required",
+      userVerification: "required",
+      ...(securityKey ? { authenticatorAttachment: "cross-platform" } : {}),
+    },
+    ...hints(),
+    excludeCredentials: cfg.exclude.map((id) => ({ type: "public-key", id: dec(id) })),
+    extensions: { prf: { eval: { first: dec(cfg.salt) } } },
+  } });
+  const ext = cred.getClientExtensionResults();
+  if (!ext.prf || ext.prf.enabled === false) {
+    return fail("This passkey provider can't protect backups: it doesn't support the PRF " +
+      "extension. Nothing was set up. Try another provider or a security key.");
+  }
+  let out = ext.prf.results && ext.prf.results.first;
+  if (!out) {
+    // Many providers only return PRF output on sign-in, not at creation.
+    say("Passkey created. One more approval is needed to finish.");
+    await waitForClick($("again"));
+    say("Waiting for your passkey…");
+    const a = await navigator.credentials.get({ publicKey: {
+      rpId: location.hostname,
+      challenge: dec(cfg.challenge),
+      allowCredentials: [{ type: "public-key", id: cred.rawId }],
+      userVerification: "required",
+      ...hints(),
+      extensions: { prf: { eval: { first: dec(cfg.salt) } } },
+    } });
+    const r = a.getClientExtensionResults().prf;
+    out = r && r.results && r.results.first;
+  }
+  if (!out) {
+    return fail("The passkey was created but returned no PRF output, so it can't protect " +
+      "backups. Nothing was set up. You may want to delete that passkey.");
+  }
+  await post({ credentialId: enc(cred.rawId), prf: enc(out) });
+  say("Done. You can close this tab and return to the app.", "ok");
+}
+
+async function unlock() {
+  const evalByCredential = {};
+  for (const c of cfg.credentials) evalByCredential[c.id] = { first: dec(c.salt) };
+  const a = await navigator.credentials.get({ publicKey: {
+    rpId: location.hostname,
+    challenge: dec(cfg.challenge),
+    allowCredentials: cfg.credentials.map((c) => ({ type: "public-key", id: dec(c.id) })),
+    userVerification: "required",
+    ...hints(),
+    extensions: { prf: { evalByCredential } },
+  } });
+  const r = a.getClientExtensionResults().prf;
+  const out = r && r.results && r.results.first;
+  if (!out) {
+    return fail("That passkey returned no PRF output, so it can't unlock the backups.");
+  }
+  await post({ credentialId: enc(a.rawId), prf: enc(out) });
+  say("Unlocked. You can close this tab and return to the app.", "ok");
+}
+
+function start() {
+  const route = LOCAL ? LOOPBACK.test(cfg && cfg.resultUrl || "") : MAILBOX.test(cfg && cfg.mailbox || "");
+  if (!cfg || cfg.v !== 1 || !route || !cfg.appKey || !cfg.token) {
+    $("intro").textContent = "Open this page from the lighthouse-scrobbler app. " +
+      "It can't do anything on its own.";
+    return;
+  }
+  if (cfg.mode === "enroll") {
+    $("title").textContent = "Set up a passkey for your backups";
+    $("intro").textContent = "Your browser will ask you to create a passkey. It protects your " +
+      "listening-history backups, so you can restore them on another computer without a password.";
+  } else if (cfg.mode === "unlock") {
+    $("title").textContent = "Unlock your backups";
+    $("intro").textContent = "The lighthouse-scrobbler app on this computer asked to unlock your " +
+      "backups. Approve only if you just started a restore or are adding a passkey.";
+  } else {
+    $("intro").textContent = "Unknown request.";
+    return;
+  }
+  $("choose").hidden = false;
+  const begin = async (useSecurityKey) => {
+    securityKey = useSecurityKey;
+    $("choose").hidden = true;
+    say(useSecurityKey ? "Insert your security key, then follow your browser's prompts…"
+                       : "Waiting for your passkey…");
+    if (!window.PublicKeyCredential || !crypto.subtle) {
+      return fail("This browser doesn't support passkeys.");
+    }
+    try {
+      await (cfg.mode === "enroll" ? enroll() : unlock());
+    } catch (e) {
+      const name = e && e.name;
+      if (name === "NotAllowedError") {
+        say("The passkey prompt was cancelled, timed out, or refused by the browser (" +
+          (e.message || name) + "). Choose an option to try again.", "error");
+        $("choose").hidden = false;
+      } else if (name === "InvalidStateError") {
+        fail("This passkey provider already has a passkey for these backups. " +
+          "Choose a different provider or key to add a second one.");
+      } else {
+        fail("Passkey error: " + (e && e.message ? e.message : String(e)));
+      }
+    }
+  };
+  $("go-key").addEventListener("click", () => begin(true));
+  $("go-device").addEventListener("click", () => begin(false));
+}
+start();
+</script>
+</body>
+</html>

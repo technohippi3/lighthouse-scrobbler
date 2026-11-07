@@ -1,0 +1,11 @@
+[Unit]
+Description=Record Rhythmbox plays to a local history
+Documentation=file://%h/.local/share/doc/lighthouse-scrobbler/README.md
+
+[Service]
+ExecStart=%h/.cargo/bin/lighthouse-scrobbler run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

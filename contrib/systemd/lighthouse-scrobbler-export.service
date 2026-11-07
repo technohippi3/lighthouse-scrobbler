@@ -1,0 +1,7 @@
+[Unit]
+Description=Write an encrypted snapshot of the listening history
+
+[Service]
+Type=oneshot
+# Change the destination to an external drive or a synced folder.
+ExecStart=%h/.cargo/bin/lighthouse-scrobbler export --to %h/Backups/scrobbles
