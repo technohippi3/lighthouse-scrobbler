@@ -239,3 +239,11 @@ database stays the source of truth throughout.
    if needed.
 4. Later work: your own player talking to the daemon over IPC, Windows and macOS
    adapters, Arweave, and Last.fm.
+
+## License
+
+Licensed under either of the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option. Unless you
+explicitly state otherwise, any contribution you intentionally submit for
+inclusion in this work, as defined in the Apache-2.0 license, is dual-licensed
+as above, without any additional terms or conditions.
