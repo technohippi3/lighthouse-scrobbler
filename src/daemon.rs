@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use time::OffsetDateTime;
 
 use crate::db::{self, Listen};
-use crate::lock;
+use crate::{install, lock};
 use crate::mpris::{self, Event, Watcher};
 use crate::paths::Paths;
 use crate::tracker::{Action, Tracker};
@@ -23,6 +23,7 @@ pub fn run(paths: &Paths) -> Result<()> {
     let _lock = lock::exclusive(paths)
         .context("another `run` is already recording, or an import is in progress")?;
     let conn = db::open(&paths.db())?;
+    let rec = Recorder { conn, stream_id: install::stream_id(paths)? };
 
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
@@ -38,11 +39,11 @@ pub fn run(paths: &Paths) -> Result<()> {
     let mut tracker = Tracker::new();
 
     eprintln!("watching {}", mpris::BUS_NAME);
-    attach(&watcher, &mut tracker, now(), &conn)?;
+    attach(&watcher, &mut tracker, now(), &rec)?;
 
     loop {
         if stop.load(Ordering::SeqCst) {
-            apply(&conn, tracker.shutdown(now()))?;
+            apply(&rec, tracker.shutdown(now()))?;
             eprintln!("stopped");
             return Ok(());
         }
@@ -56,46 +57,57 @@ pub fn run(paths: &Paths) -> Result<()> {
         match rx.recv_timeout(wait) {
             Ok(Event::Changed { status, track }) => {
                 if let Some(track) = track {
-                    apply(&conn, tracker.metadata(now(), wall, track))?;
+                    apply(&rec, tracker.metadata(now(), wall, track))?;
                 }
                 if let Some(status) = status {
-                    apply(&conn, tracker.status(now(), wall, status))?;
+                    apply(&rec, tracker.status(now(), wall, status))?;
                 }
             }
             Ok(Event::Appeared) => {
                 eprintln!("rhythmbox appeared");
-                attach(&watcher, &mut tracker, now(), &conn)?;
+                attach(&watcher, &mut tracker, now(), &rec)?;
             }
             Ok(Event::Vanished) => {
                 eprintln!("rhythmbox went away");
-                apply(&conn, tracker.gone(now()))?;
+                apply(&rec, tracker.gone(now()))?;
             }
             Ok(Event::Failed(why)) => {
-                apply(&conn, tracker.shutdown(now()))?;
+                apply(&rec, tracker.shutdown(now()))?;
                 bail!("lost the D-Bus connection: {why}");
             }
-            Err(RecvTimeoutError::Timeout) => apply(&conn, tracker.tick(now()))?,
+            Err(RecvTimeoutError::Timeout) => apply(&rec, tracker.tick(now()))?,
             Err(RecvTimeoutError::Disconnected) => {
-                apply(&conn, tracker.shutdown(now()))?;
+                apply(&rec, tracker.shutdown(now()))?;
                 bail!("D-Bus listener threads exited");
             }
         }
     }
 }
 
-fn attach(watcher: &Watcher, tracker: &mut Tracker, now: u64, conn: &Connection) -> Result<()> {
+struct Recorder {
+    conn: Connection,
+    stream_id: String,
+}
+
+fn attach(watcher: &Watcher, tracker: &mut Tracker, now: u64, rec: &Recorder) -> Result<()> {
     if let Some(s) = watcher.snapshot() {
         let wall = OffsetDateTime::now_utc();
-        apply(conn, tracker.attach(now, wall, s.status, s.track, s.position_ms))?;
+        apply(rec, tracker.attach(now, wall, s.status, s.track, s.position_ms))?;
     }
     Ok(())
 }
 
-fn apply(conn: &Connection, actions: Vec<Action>) -> Result<()> {
+fn apply(rec: &Recorder, actions: Vec<Action>) -> Result<()> {
+    let conn = &rec.conn;
     for action in actions {
         match action {
             Action::Record(q) => {
-                let listen = Listen::from_qualified(&q, mpris::PLAYER, OffsetDateTime::now_utc())?;
+                let listen = Listen::from_qualified(
+                    &q,
+                    mpris::PLAYER,
+                    &rec.stream_id,
+                    OffsetDateTime::now_utc(),
+                )?;
                 db::insert(conn, &listen)?;
                 eprintln!(
                     "recorded: {} - {} ({}, after {}s)",

@@ -12,6 +12,7 @@ anyhow = "1.0.104"
 base64 = "0.23.1"
 bech32 = "0.12.0"
 bip39 = { version = "3.0.0", features = ["zeroize"] }
+bs58 = "0.5.1"
 chacha20poly1305 = "0.10"
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom = "0.4.3"

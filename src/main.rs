@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use lighthouse_scrobbler::phrase::{self, Secret};
 use lighthouse_scrobbler::recovery::{self, Descriptor};
-use lighthouse_scrobbler::{ceremony, daemon, db, folder, keys, lock, paths::Paths};
+use lighthouse_scrobbler::{backup, ceremony, daemon, db, folder, ipfs, keys, lighthouse, lock, paths::Paths};
 
 /// Record Rhythmbox plays to a local history, with encrypted backups that a
 /// passkey unlocks. Recording and backups make no network connections.
@@ -52,12 +52,23 @@ enum Command {
     /// Restore the newest backup in a folder by approving a passkey in your
     /// browser. `run` must be stopped.
     Restore {
+        /// A backup folder.
+        #[arg(long, required_unless_present = "from_lighthouse", conflicts_with = "from_lighthouse")]
+        from: Option<PathBuf>,
+        /// Restore from this profile's Lighthouse account instead
+        /// (run `lighthouse-key` first on a fresh machine).
         #[arg(long)]
-        from: PathBuf,
+        from_lighthouse: bool,
         /// Fallback: unlock with recovery words instead of a passkey.
         #[arg(long)]
         recovery_words: bool,
     },
+    /// Save the Lighthouse API key this profile uploads with. Reads it from
+    /// stdin, or prompts without echo.
+    LighthouseKey,
+    /// Upload new and changed listens, the recovery file and a manifest to
+    /// Lighthouse.
+    SyncLighthouse,
     /// Optional paper backup: after approving your passkey, show the 12
     /// recovery words for these backups.
     RecoveryWords {
@@ -111,7 +122,27 @@ fn real_main() -> Result<()> {
         Command::EnrollPasskey { backups, recovery_words, new_key } => {
             enroll_passkey(&paths, &backups, recovery_words, new_key)
         }
-        Command::Restore { from, recovery_words } => restore(&paths, &from, recovery_words),
+        Command::Restore { from, from_lighthouse, recovery_words } => match from {
+            Some(from) if !from_lighthouse => restore(&paths, &from, recovery_words),
+            _ => restore_lighthouse(&paths, recovery_words),
+        },
+        Command::LighthouseKey => save_lighthouse_key(&paths),
+        Command::SyncLighthouse => {
+            paths.ensure()?;
+            let mut conn = db::open(&paths.db())?;
+            let r = lighthouse::sync(&mut conn, &paths)?;
+            match &r.batch {
+                Some((cid, n)) => println!("uploaded {n} new or changed play(s) as {cid}"),
+                None => println!("no new plays to upload"),
+            }
+            if r.recovery_uploaded {
+                println!("uploaded the passkey recovery file");
+            }
+            if let Some(m) = &r.manifest {
+                println!("published manifest {m}");
+            }
+            Ok(())
+        }
         Command::RecoveryWords { backups, batch } => show_recovery_words(&backups, batch),
         Command::CheckRecoveryWords => {
             let stored = keys::load_recipient(&paths)?;
@@ -225,6 +256,83 @@ fn enroll_passkey(paths: &Paths, backups: &Path, recovery_words: bool, new_key: 
         println!("This passkey is the only way to restore. Add a second one when you can:");
         println!("  lighthouse-scrobbler enroll-passkey --backups {}", backups.display());
     }
+    Ok(())
+}
+
+fn save_lighthouse_key(paths: &Paths) -> Result<()> {
+    paths.ensure()?;
+    let key = Zeroizing::new(if io::stdin().is_terminal() {
+        rpassword::prompt_password("Lighthouse API key: ")?
+    } else {
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        line
+    });
+    let key = key.trim();
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        bail!("that doesn't look like an API key");
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = lighthouse::key_path(paths);
+    let tmp = path.with_extension("partial");
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    writeln!(f, "{key}")?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    println!("saved to {} (readable only by you)", path.display());
+    Ok(())
+}
+
+fn restore_lighthouse(paths: &Paths, recovery_words: bool) -> Result<()> {
+    paths.ensure()?;
+    let _lock = lock::exclusive(paths)
+        .context("stop `run` first (systemctl --user stop lighthouse-scrobbler)")?;
+    let mut gateways = ipfs::Gateways::from_env();
+    let found = lighthouse::find_latest(paths, &mut gateways)?;
+    let manifest = &found.manifest;
+    let secret = if recovery_words {
+        read_words()?
+    } else {
+        let d = found
+            .descriptor
+            .as_ref()
+            .context("these backups have no passkey recovery file; add --recovery-words")?;
+        let out = ceremony::unlock(&d.envelopes)?;
+        let envelope =
+            d.find(&out.credential_id).context("that passkey is not enrolled for these backups")?;
+        recovery::unwrap(d, envelope, &out.prf_output)?
+    };
+    let identity = phrase::identity(&secret)?;
+    let recipient = identity.to_public();
+    if recipient.to_string() != manifest.recipient {
+        bail!("that key does not belong to these backups");
+    }
+    if let Some(r) = profile_recipient(paths)?
+        && r != manifest.recipient
+    {
+        bail!("this profile already uses a different backup key");
+    }
+    let mut conn = db::open(&paths.db())?;
+    let (mut added, mut updated, mut present) = (0, 0, 0);
+    for (i, batch) in manifest.batches.iter().enumerate() {
+        eprintln!("batch {}/{}: {} play(s)", i + 1, manifest.batches.len(), batch.records);
+        let bytes = lighthouse::fetch_ref(&mut gateways, &batch.file)?;
+        let r = backup::import_archive(&mut conn, &identity, std::io::Cursor::new(bytes))?;
+        added += r.added;
+        updated += r.updated;
+        present += r.unchanged;
+    }
+    if !paths.recipient().exists() {
+        keys::replace_recipient(paths, &recipient)?;
+    }
+    if let Some(d) = &found.descriptor {
+        folder::remember_descriptor(paths, d)?;
+    }
+    lighthouse::adopt(&conn, manifest)?;
+    println!(
+        "restored {} batch(es) from Lighthouse: {added} added, {updated} updated, {present} already present",
+        manifest.batches.len()
+    );
     Ok(())
 }
 

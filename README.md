@@ -130,6 +130,63 @@ the code, `src/backup.rs` reads and writes archives as streams, and
 temporary files, permissions, atomic renames and the recovery file. Playback
 tracking and the database know nothing about storage.
 
+## Lighthouse
+
+Lighthouse is an optional second destination, alongside the folder. Create an
+API key at `files.lighthouse.storage` under Dashboard, then Auth keys, and
+save it:
+
+```bash
+lighthouse-scrobbler lighthouse-key
+```
+
+The key is stored in `~/.config/lighthouse-scrobbler/lighthouse-api-key`,
+readable only by you, and never logged. Treat it as full access to the
+Lighthouse account; Lighthouse documents no scopes or expiry for keys.
+
+```bash
+lighthouse-scrobbler sync-lighthouse
+```
+
+Each sync uploads only what Lighthouse doesn't have yet:
+
+1. A batch of the plays added or changed since the last batch, in the same
+   encrypted archive format.
+2. The passkey recovery file, if it changed.
+3. A plain-JSON manifest listing every batch and the current recovery file
+   by CID.
+
+The manifest goes up last, only after everything it lists has been uploaded.
+It shows file sizes, counts and times, which Lighthouse already knows, and
+nothing about listens. A sync with nothing new uploads nothing. What has been
+uploaded is recorded in its own table, apart from listen records, so a failed
+upload is simply retried next time. Every uploaded file's name starts with
+`lhs-`, and the app never reads or touches anything else in the account. The
+app checks that the CID Lighthouse returns matches what it sent. To run a
+sync daily, copy `contrib/systemd/lighthouse-scrobbler-lighthouse-sync.*`
+next to the other units and enable the timer.
+
+To restore on a fresh machine, save the key there first, then:
+
+```bash
+lighthouse-scrobbler restore --from-lighthouse
+```
+
+The restore lists the account's files, takes the newest manifest, asks for
+your passkey (or add `--recovery-words`), and rebuilds the history batch by
+batch. Downloads come from Lighthouse's gateway or public IPFS gateways, set
+with `LIGHTHOUSE_SCROBBLER_GATEWAYS`. Every block is checked against its CID
+before use, so a gateway can be slow or dishonest without changing what is
+restored. Afterwards the new install continues where the old one stopped
+and doesn't upload the restored plays again.
+
+A current limit: on Lighthouse's free plan, uploads work but downloads
+don't. Lighthouse's gateway answers "402 Payment Required". New uploads had
+no public IPFS provider after 20 minutes, so public gateways can't find them
+either. Cold restore from Lighthouse therefore needs a paid plan, or a
+gateway that can reach Lighthouse's nodes. Keep the folder backup as the
+restore that works today.
+
 ## Fallback: recovery words
 
 Passkeys are the normal path, and nothing asks for words along the way. Every
@@ -220,17 +277,11 @@ results are logged in
 These steps come after the MVP, in order, and each one is optional. The local
 database stays the source of truth throughout.
 
-1. A first remote destination, such as Lighthouse, Sia or Arweave. Folder
-   sets already cover external drives and sync services. A remote destination
-   adds only what it needs: a shared destination interface, once there are two
-   implementations; incremental batches of new and updated records, because
-   uploading full snapshots daily would pay again for the same plays and a
-   play's observed duration can change after it qualifies; delivery
-   bookkeeping, so finished uploads are never republished and failed ones are
-   retried; and a way for a fresh machine to find the set (an object key, an
-   IPFS CID and an Arweave transaction ID behave differently). Archives and
-   the recovery file travel together, and the encryption key and enrolled
-   passkeys stay the same whichever provider holds them.
+1. Make Lighthouse cold restore work without a paid plan, through a gateway
+   or provider that can actually reach the content, and add an independent
+   second remote copy (another pinning service, Sia or Arweave). The batch,
+   manifest and verification design carries over. A shared destination
+   interface comes once there are two remote implementations.
 2. ListenBrainz. Add a per-destination delivery queue with explicit outcomes
    (accepted, permanently ignored, deferred, transient, needs re-auth), and
    backfill the existing history.

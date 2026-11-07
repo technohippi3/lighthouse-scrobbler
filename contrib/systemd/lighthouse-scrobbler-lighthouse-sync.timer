@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily upload of new plays to Lighthouse
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

@@ -13,6 +13,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_lighthouse-scrobbler");
 thread_local! {
     /// The fake mailbox relay a hosted-mode test points the app at.
     static RELAY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// Extra environment for every process a test starts.
+    static EXTRA_ENV: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A stand-in for the Worker's mailbox: PUT stores, GET collects once.
@@ -50,6 +52,11 @@ fn spawn(home: &Path, args: &[&str], stdin: Option<&str>, rp: &str) -> Child {
     if let Some(relay) = RELAY.with(|r| r.borrow().clone()) {
         cmd.env("LIGHTHOUSE_SCROBBLER_RELAY", relay);
     }
+    EXTRA_ENV.with(|e| {
+        for (k, v) in e.borrow().iter() {
+            cmd.env(k, v);
+        }
+    });
     let mut child = cmd
         .args(args)
         .env("LIGHTHOUSE_SCROBBLER_HOME", home)
@@ -441,6 +448,7 @@ fn sample(n: u32) -> lighthouse_scrobbler::db::Listen {
         player: "rhythmbox".into(),
         player_track_id: Some(format!("/org/mpris/MediaPlayer2/Track/{n}")),
         recorded_at: "2026-11-07T20:00:00Z".into(),
+        stream_id: None,
     }
 }
 
@@ -568,4 +576,141 @@ fn backup_set_copied_to_another_folder_restores_on_its_own() {
         .env("LIGHTHOUSE_SCROBBLER_HOME", &fresh).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("another profile"));
+}
+
+/// A stand-in for Lighthouse: upload, list and a raw-block gateway, with real
+/// CIDs. A second "gateway" serves corrupted blocks.
+fn start_fake_lighthouse() -> (String, String) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    #[derive(Default)]
+    struct Store {
+        blocks: HashMap<String, Vec<u8>>,
+        files: Vec<serde_json::Value>,
+    }
+    let store: Arc<Mutex<Store>> = Arc::default();
+    {
+        // Someone else's file in the same account.
+        let mut st = store.lock().unwrap();
+        st.files.push(serde_json::json!({"id": "other-1", "fileName": "memes", "cid": "QmapMmLhoJ7Cfq84o2xuB162pFqXUYYpBQ1ybhL4ztGw6h", "createdAt": 1}));
+    }
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", server.server_addr().to_ip().unwrap().port());
+    let bad = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let bad_base = format!("http://127.0.0.1:{}", bad.server_addr().to_ip().unwrap().port());
+    std::thread::spawn(move || {
+        for req in bad.incoming_requests() {
+            let _ = req.respond(tiny_http::Response::from_data(b"not the block you asked for".to_vec()));
+        }
+    });
+    let st = store.clone();
+    std::thread::spawn(move || {
+        for mut req in server.incoming_requests() {
+            let url = req.url().to_string();
+            let authed = req.headers().iter().any(|h| h.field.equiv("Authorization") && h.value.as_str() == "Bearer test-key");
+            if url.starts_with("/api/v0/add") {
+                assert!(authed, "upload without the key");
+                let mut body = Vec::new();
+                req.as_reader().read_to_end(&mut body).unwrap();
+                let text = String::from_utf8_lossy(&body);
+                let name = text.split("filename=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+                let start = body.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let end = body.windows(4).rposition(|w| w == b"\r\n--").unwrap();
+                let file = &body[start..end];
+                let (root, blocks) = lighthouse_scrobbler::ipfs::encode_file_with(file, 1024 * 1024);
+                let mut s = st.lock().unwrap();
+                for (c, b) in blocks {
+                    s.blocks.insert(c.to_string(), b);
+                }
+                let n = s.files.len() as u64 + 1;
+                s.files.push(serde_json::json!({"id": format!("id-{n}"), "fileName": name, "cid": root.to_string(), "createdAt": 1000 + n}));
+                let _ = req.respond(tiny_http::Response::from_string(
+                    serde_json::json!({"Name": name, "Hash": root.to_string(), "Size": file.len().to_string()}).to_string()));
+            } else if url.starts_with("/api/user/files_uploaded") {
+                assert!(authed, "listing without the key");
+                let last = url.split("lastKey=").nth(1).unwrap_or("null").to_string();
+                let s = st.lock().unwrap();
+                let files: Vec<_> = if last == "null" { s.files.clone() } else { vec![] };
+                let _ = req.respond(tiny_http::Response::from_string(
+                    serde_json::json!({"fileList": files, "totalFiles": s.files.len()}).to_string()));
+            } else if let Some(rest) = url.strip_prefix("/ipfs/") {
+                let cid = rest.split('?').next().unwrap();
+                match st.lock().unwrap().blocks.get(cid) {
+                    Some(b) => { let _ = req.respond(tiny_http::Response::from_data(b.clone())); }
+                    None => { let _ = req.respond(tiny_http::Response::empty(404)); }
+                }
+            } else {
+                let _ = req.respond(tiny_http::Response::empty(404));
+            }
+        }
+    });
+    (base, bad_base)
+}
+
+fn run_ok(home: &Path, args: &[&str], stdin: Option<&str>) -> String {
+    finish(start(home, args, stdin))
+}
+
+#[test]
+fn lighthouse_sync_is_incremental_and_restores_from_scratch() {
+    let (lh, bad_gateway) = start_fake_lighthouse();
+    EXTRA_ENV.with(|e| {
+        *e.borrow_mut() = vec![
+            ("LIGHTHOUSE_SCROBBLER_LIGHTHOUSE_API".into(), lh.clone()),
+            ("LIGHTHOUSE_SCROBBLER_LIGHTHOUSE_UPLOAD".into(), lh.clone()),
+            ("LIGHTHOUSE_SCROBBLER_GATEWAYS".into(), format!("{bad_gateway},{lh}")),
+        ]
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let laptop = tmp.path().join("laptop");
+    let folder = tmp.path().join("usb");
+
+    let mut c = start(&laptop, &["enroll-passkey", "--backups", folder.to_str().unwrap()], None);
+    complete(&ceremony_url(&mut c), "key-1", &[4u8; 32]);
+    finish(c);
+    let paths = lighthouse_scrobbler::paths::Paths { data: laptop.join("data"), config: laptop.join("config") };
+    let conn = lighthouse_scrobbler::db::open(&paths.db()).unwrap();
+    for n in 0..3 {
+        lighthouse_scrobbler::db::insert(&conn, &sample(n)).unwrap();
+    }
+    run_ok(&laptop, &["lighthouse-key"], Some("test-key\n"));
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(laptop.join("config/lighthouse-api-key")).unwrap().permissions());
+    assert_eq!(mode & 0o077, 0);
+
+    let out = run_ok(&laptop, &["sync-lighthouse"], None);
+    assert!(out.contains("uploaded 3 new or changed"), "{out}");
+    assert!(out.contains("recovery file") && out.contains("published manifest"), "{out}");
+
+    // Nothing new: nothing uploaded, not even a manifest.
+    let out = run_ok(&laptop, &["sync-lighthouse"], None);
+    assert!(out.contains("no new plays") && !out.contains("manifest"), "{out}");
+
+    // One new play and one changed play make a two-record batch.
+    lighthouse_scrobbler::db::insert(&conn, &sample(3)).unwrap();
+    lighthouse_scrobbler::db::set_observed(&conn, &sample(0).id, 250_000).unwrap();
+    drop(conn);
+    let out = run_ok(&laptop, &["sync-lighthouse"], None);
+    assert!(out.contains("uploaded 2 new or changed"), "{out}");
+    assert!(!out.contains("recovery file"), "unchanged recovery file is not re-sent: {out}");
+
+    // Lose the laptop and its USB drive: restore from Lighthouse alone.
+    std::fs::remove_dir_all(&laptop).unwrap();
+    std::fs::remove_dir_all(&folder).unwrap();
+    let fresh = tmp.path().join("fresh");
+    run_ok(&fresh, &["lighthouse-key"], Some("test-key\n"));
+    let mut c = start(&fresh, &["restore", "--from-lighthouse"], None);
+    complete(&ceremony_url(&mut c), "key-1", &[4u8; 32]);
+    let out = finish(c);
+    assert!(out.contains("restored 2 batch(es)") && out.contains("4 added") && out.contains("1 updated"), "{out}");
+    let conn = lighthouse_scrobbler::db::open(&fresh.join("data/history.sqlite")).unwrap();
+    for n in 1..4 {
+        assert_eq!(lighthouse_scrobbler::db::get(&conn, &sample(n).id).unwrap().unwrap(), sample(n));
+    }
+    assert_eq!(lighthouse_scrobbler::db::get(&conn, &sample(0).id).unwrap().unwrap().observed_listened_ms, Some(250_000));
+    drop(conn);
+
+    // The restored install continues where the old one stopped.
+    let out = run_ok(&fresh, &["sync-lighthouse"], None);
+    assert!(out.contains("no new plays"), "restored plays are not uploaded again: {out}");
+    EXTRA_ENV.with(|e| e.borrow_mut().clear());
 }

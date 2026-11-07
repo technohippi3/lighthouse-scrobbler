@@ -33,19 +33,28 @@ struct Header {
     count: u64,
 }
 
-/// Stream a full snapshot of the history, encrypted to `recipient`, into
-/// `out`, and hand `out` back once every layer is finished. Plaintext exists
-/// only in memory buffers.
+pub struct Written<W> {
+    pub out: W,
+    pub records: u64,
+    /// The newest change marker included, or `since` if nothing was.
+    pub max_change_seq: u64,
+}
+
+/// Stream listens added or changed after `since` (0 for the whole history),
+/// encrypted to `recipient`, into `out`, and hand `out` back once every layer
+/// is finished. Plaintext exists only in memory buffers. A full snapshot and
+/// an incremental batch are the same format; importing merges by UUID.
 pub fn write_archive<W: Write>(
     conn: &mut Connection,
     recipient: &Recipient,
     out: W,
     created_at: OffsetDateTime,
-) -> Result<W> {
+    since: u64,
+) -> Result<Written<W>> {
     // The count and the rows come from the same consistent snapshot, even
     // while the recorder keeps writing.
     let tx = conn.transaction()?;
-    let count = db::count(&tx)?;
+    let count = db::count_since(&tx, since)?;
 
     let encryptor = age::Encryptor::with_recipients(iter::once(recipient as &dyn age::Recipient))?;
     let encrypted = encryptor.wrap_output(out)?;
@@ -61,10 +70,12 @@ pub fn write_archive<W: Write>(
     serde_json::to_writer(&mut zstd, &header)?;
     zstd.write_all(b"\n")?;
     let mut written = 0u64;
-    db::for_each(&tx, |listen| {
+    let mut max_change_seq = since;
+    db::for_each_since(&tx, since, |listen, seq| {
         serde_json::to_writer(&mut zstd, &listen)?;
         zstd.write_all(b"\n")?;
         written += 1;
+        max_change_seq = max_change_seq.max(seq);
         Ok(())
     })?;
     tx.finish()?;
@@ -73,7 +84,7 @@ pub fn write_archive<W: Write>(
     }
 
     let encrypted = zstd.finish()?;
-    Ok(encrypted.finish()?)
+    Ok(Written { out: encrypted.finish()?, records: written, max_change_seq })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

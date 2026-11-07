@@ -10,9 +10,29 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::tracker::Qualified;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 
 /// One recorded play. The same shape is used in the database and in backups.
+///
+/// Identifier meanings, which differ in how far they can be trusted:
+/// - `id` is this listen's own UUID, assigned once by the recorder and kept
+///   through every backup, restore and retry. Deduplicate by it.
+/// - `mb_track_id` is copied from the player's `xesam:musicBrainzTrackID`.
+///   Rhythmbox fills that from the file's "MusicBrainz Track Id" tag, which
+///   holds a MusicBrainz recording ID (verified on one Rhythmbox file, where it
+///   resolved to the matching recording). Other players may put something
+///   else there, such as a release-track ID, so treat it as a recording ID
+///   only where the player adapter is known to supply one. Public formats
+///   should name it `musicbrainz_recording_id`.
+/// - `mb_album_id` and `mb_artist_id` come from `xesam:musicBrainzAlbumID`
+///   (a release ID) and `xesam:musicBrainzArtistID`.
+/// - `player_track_id` is the player's own handle for the track (Rhythmbox's
+///   library entry). It is local and device-specific; never publish it.
+/// - `url` is the player's location for the track, often a local file path;
+///   never publish it.
+/// - `stream_id` identifies the installation that recorded the listen. It is
+///   random, not derived from hardware, and absent on listens recorded before
+///   it existed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Listen {
     pub id: String,
@@ -38,10 +58,17 @@ pub struct Listen {
     pub player: String,
     pub player_track_id: Option<String>,
     pub recorded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
 }
 
 impl Listen {
-    pub fn from_qualified(q: &Qualified, player: &str, now: OffsetDateTime) -> Result<Self> {
+    pub fn from_qualified(
+        q: &Qualified,
+        player: &str,
+        stream_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Self> {
         let t = &q.track;
         Ok(Listen {
             id: q.id.to_string(),
@@ -63,6 +90,7 @@ impl Listen {
             player: player.to_string(),
             player_track_id: Some(t.track_id.clone()),
             recorded_at: now.format(&Rfc3339)?,
+            stream_id: Some(stream_id.to_string()),
         })
     }
 
@@ -95,7 +123,7 @@ impl Listen {
 
 const COLUMNS: &str = "id, started_at, title, artist, album, album_artist, track_number, \
      disc_number, duration_ms, qualified_after_ms, qualification_rule, observed_listened_ms, \
-     mb_track_id, mb_album_id, mb_artist_id, url, player, player_track_id, recorded_at";
+     mb_track_id, mb_album_id, mb_artist_id, url, player, player_track_id, recorded_at, stream_id";
 
 fn row_to_listen(r: &rusqlite::Row<'_>) -> rusqlite::Result<Listen> {
     Ok(Listen {
@@ -118,6 +146,7 @@ fn row_to_listen(r: &rusqlite::Row<'_>) -> rusqlite::Result<Listen> {
         player: r.get(16)?,
         player_track_id: r.get(17)?,
         recorded_at: r.get(18)?,
+        stream_id: r.get(19)?,
     })
 }
 
@@ -125,7 +154,7 @@ pub fn insert(conn: &Connection, l: &Listen) -> Result<()> {
     conn.execute(
         &format!(
             "INSERT INTO listens ({COLUMNS}) VALUES \
-             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
         ),
         params![
             l.id,
@@ -147,6 +176,7 @@ pub fn insert(conn: &Connection, l: &Listen) -> Result<()> {
             l.player,
             l.player_track_id,
             l.recorded_at,
+            l.stream_id,
         ],
     )?;
     Ok(())
@@ -175,19 +205,37 @@ pub fn recent(conn: &Connection, limit: usize) -> Result<Vec<Listen>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn count(tx: &Transaction<'_>) -> Result<u64> {
-    let n: i64 = tx.query_row("SELECT COUNT(*) FROM listens", [], |r| r.get(0))?;
+/// Listens added or changed after `since` (0 selects all of them).
+pub fn count_since(tx: &Transaction<'_>, since: u64) -> Result<u64> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM listens WHERE change_seq > ?1",
+        [since as i64],
+        |r| r.get(0),
+    )?;
     Ok(n as u64)
 }
 
-/// Visit every listen, oldest first, one row at a time, inside the caller's
-/// transaction. Memory use does not depend on the size of the history.
-pub fn for_each(tx: &Transaction<'_>, mut visit: impl FnMut(Listen) -> Result<()>) -> Result<()> {
-    let mut stmt =
-        tx.prepare(&format!("SELECT {COLUMNS} FROM listens ORDER BY started_at, id"))?;
-    let mut rows = stmt.query([])?;
+/// The newest change marker, or 0 for an empty history.
+pub fn max_change_seq(conn: &Connection) -> Result<u64> {
+    let n: Option<i64> = conn.query_row("SELECT MAX(change_seq) FROM listens", [], |r| r.get(0))?;
+    Ok(n.unwrap_or(0) as u64)
+}
+
+/// Visit every listen added or changed after `since`, oldest first, one row
+/// at a time, inside the caller's transaction, with its change marker.
+/// Memory use does not depend on the size of the history.
+pub fn for_each_since(
+    tx: &Transaction<'_>,
+    since: u64,
+    mut visit: impl FnMut(Listen, u64) -> Result<()>,
+) -> Result<()> {
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {COLUMNS}, change_seq FROM listens WHERE change_seq > ?1 ORDER BY started_at, id"
+    ))?;
+    let mut rows = stmt.query([since as i64])?;
     while let Some(row) = rows.next()? {
-        visit(row_to_listen(row)?)?;
+        let seq: i64 = row.get(20)?;
+        visit(row_to_listen(row)?, seq as u64)?;
     }
     Ok(())
 }
@@ -286,6 +334,51 @@ fn migrate(conn: &Connection) -> Result<()> {
                  );
                  CREATE INDEX listens_started_at ON listens (started_at);
                  PRAGMA user_version = 1;
+                 COMMIT;",
+            )?;
+            migrate(conn)
+        }
+        1 => {
+            // Additive: listens recorded before this keep no stream ID.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE listens ADD COLUMN stream_id TEXT;
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+            migrate(conn)
+        }
+        2 => {
+            // change_seq marks the order in which listens were added or
+            // changed, so a remote destination can send only what is new.
+            // Triggers keep it current; nothing else has to remember it.
+            // remote_files records what each destination already holds.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE listens ADD COLUMN change_seq INTEGER NOT NULL DEFAULT 0;
+                 UPDATE listens SET change_seq = rowid;
+                 CREATE INDEX listens_change_seq ON listens (change_seq);
+                 CREATE TRIGGER listens_seq_on_insert AFTER INSERT ON listens BEGIN
+                     UPDATE listens SET change_seq = (SELECT MAX(change_seq) FROM listens) + 1
+                     WHERE rowid = NEW.rowid;
+                 END;
+                 CREATE TRIGGER listens_seq_on_update AFTER UPDATE OF observed_listened_ms ON listens BEGIN
+                     UPDATE listens SET change_seq = (SELECT MAX(change_seq) FROM listens) + 1
+                     WHERE rowid = NEW.rowid;
+                 END;
+                 CREATE TABLE remote_files (
+                     destination    TEXT NOT NULL,
+                     name           TEXT NOT NULL,
+                     kind           TEXT NOT NULL,
+                     cid            TEXT NOT NULL,
+                     sha256         TEXT NOT NULL,
+                     size           INTEGER NOT NULL,
+                     records        INTEGER,
+                     max_change_seq INTEGER,
+                     uploaded_at    TEXT NOT NULL,
+                     PRIMARY KEY (destination, name)
+                 );
+                 PRAGMA user_version = 3;
                  COMMIT;",
             )?;
             Ok(())

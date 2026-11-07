@@ -104,8 +104,8 @@ pub fn write_archive_file(conn: &mut Connection, recipient: &Recipient, dir: &Pa
             .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        let out = backup::write_archive(conn, recipient, BufWriter::new(file), now)?;
-        let file = out.into_inner().map_err(|e| e.into_error())?;
+        let written = backup::write_archive(conn, recipient, BufWriter::new(file), now, 0)?;
+        let file = written.out.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         Ok(())
     })();

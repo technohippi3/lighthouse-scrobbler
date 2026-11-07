@@ -199,6 +199,8 @@ fn daemon_records_plays_from_a_fake_rhythmbox() {
     assert_eq!(rows[0].qualification_rule, "half_duration");
     assert!((15_500..16_700).contains(&rows[0].qualified_after_ms), "{}", rows[0].qualified_after_ms);
     assert_eq!(rows[0].observed_listened_ms, None, "still playing");
+    let stream = std::fs::read_to_string(home.join("config/stream-id.txt")).unwrap();
+    assert_eq!(rows[0].stream_id.as_deref(), Some(stream.trim()), "stamped with this install's stream ID");
 
     // Switching tracks ends A; quitting the player ends B before it qualifies.
     player.change(Some("Playing"), Some(metadata(2, "Track B", 31)));

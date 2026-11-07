@@ -26,6 +26,7 @@ fn listen(n: u32) -> Listen {
         player: "rhythmbox".into(),
         player_track_id: Some(format!("/org/mpris/MediaPlayer2/Track/{n}")),
         recorded_at: "2026-11-07T12:00:00Z".into(),
+        stream_id: None,
     }
 }
 
@@ -145,4 +146,41 @@ fn export_leaves_no_partial_files() {
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
     assert!(names[0].ends_with(".jsonl.zst.age"));
+}
+
+#[test]
+fn schema_v1_database_upgrades_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("old.sqlite");
+    {
+        // The schema exactly as version 1 created it, with one play.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE listens (
+                 id TEXT PRIMARY KEY NOT NULL, started_at TEXT NOT NULL, title TEXT NOT NULL,
+                 artist TEXT, album TEXT, album_artist TEXT, track_number INTEGER,
+                 disc_number INTEGER, duration_ms INTEGER, qualified_after_ms INTEGER NOT NULL,
+                 qualification_rule TEXT NOT NULL, observed_listened_ms INTEGER,
+                 mb_track_id TEXT, mb_album_id TEXT, mb_artist_id TEXT, url TEXT,
+                 player TEXT NOT NULL, player_track_id TEXT, recorded_at TEXT NOT NULL);
+             CREATE INDEX listens_started_at ON listens (started_at);
+             INSERT INTO listens (id, started_at, title, qualified_after_ms, qualification_rule, player, recorded_at)
+             VALUES ('00000000-0000-4000-8000-000000000001', '2026-11-07T08:00:00Z', 'Old play', 100000,
+                     'half_duration', 'rhythmbox', '2026-11-07T08:05:00Z');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let conn = db::open(&path).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 3, "upgrades through every version");
+    let seq: i64 = conn.query_row("SELECT change_seq FROM listens", [], |r| r.get(0)).unwrap();
+    assert!(seq > 0, "old plays are included in the first remote batch");
+    let old = db::get(&conn, "00000000-0000-4000-8000-000000000001").unwrap().unwrap();
+    assert_eq!(old.title, "Old play");
+    assert_eq!(old.stream_id, None, "plays from before the migration have no stream ID");
+    let mut new = listen(9);
+    new.stream_id = Some("stream-a".into());
+    db::insert(&conn, &new).unwrap();
+    assert_eq!(db::get(&conn, &new.id).unwrap().unwrap().stream_id.as_deref(), Some("stream-a"));
 }
